@@ -1,8 +1,6 @@
 """数据脱敏视图接口。
 
-本模块是题目的唯一实现文件。8 个函数当前全部是桩，调用即抛出
-NotImplementedError，因此 tests/mask/test_view.py 的 15 个测试全部为红。
-实现时必须遵守以下总契约：
+本模块是题目的唯一实现文件。实现时必须遵守以下总契约：
 
 字段级策略
     每个 schema 字段都有一条独立规则，规则含 kind、sensitive、scope、
@@ -23,6 +21,21 @@ NotImplementedError，因此 tests/mask/test_view.py 的 15 个测试全部为�
 其他
     只使用标准库，输入不得被原地修改，输出顺序确定，不使用随机数。
 """
+
+# 缺陷 10：固定令牌，不保留原值长度、分隔符、数字位或校验位。
+REDACTED = "REDACTED"
+
+_ADMIN_ROLE = "admin"
+_RULE_KEYS = (
+    "kind",
+    "sensitive",
+    "scope",
+    "group_by",
+    "aggregate",
+    "as",
+    "min_group_size",
+)
+_SCHEMA_RULE_KEYS = ("kind", "sensitive", "scope")
 
 
 def field_rules(schema, policy):
@@ -56,7 +69,46 @@ def field_rules(schema, policy):
         policy.fields 字段配置。不得修改 schema 或 policy；schema 为空时
         返回空 dict。
     """
-    raise NotImplementedError
+    # 缺陷 1/2：规则映射从完整 schema 推导，列表页与详情页字段一视同仁，
+    # 漏配字段也会得到 sensitive=True 的安全默认规则，而不是从映射中消失。
+    policy = policy or {}
+    policy_default = policy.get("default") or {}
+    field_overrides = policy.get("fields") or {}
+    aggregate_cfg = policy.get("aggregate") or {}
+    default_min_group_size = aggregate_cfg.get("min_group_size", 5)
+
+    rules = {}
+    for descriptor in schema:
+        name = descriptor["name"]
+        # 内置默认值：默认敏感、默认详情页可见，失败方向必须是“脱敏”。
+        rule = {
+            "kind": "text",
+            "sensitive": True,
+            "scope": "detail",
+            "group_by": False,
+            "aggregate": None,
+            "as": None,
+            "min_group_size": default_min_group_size,
+        }
+        # 优先级第 2 层：policy.default。
+        for key in _RULE_KEYS:
+            if key in policy_default:
+                rule[key] = policy_default[key]
+        # 优先级第 3 层：schema 字段描述（kind/scope/sensitive）。
+        for key in _SCHEMA_RULE_KEYS:
+            if key in descriptor:
+                rule[key] = descriptor[key]
+        # 优先级第 4 层：policy.fields 显式字段配置。
+        override = field_overrides.get(name)
+        if override:
+            for key in _RULE_KEYS:
+                if key in override:
+                    rule[key] = override[key]
+        # 聚合输出名缺省为 字段名_avg。
+        if rule["aggregate"] and not rule["as"]:
+            rule["as"] = f"{name}_avg"
+        rules[name] = rule
+    return rules
 
 
 def mask_value(kind, value, role):
@@ -79,7 +131,13 @@ def mask_value(kind, value, role):
     返回：
         str。admin 得到原值字符串，其他角色得到 REDACTED。
     """
-    raise NotImplementedError
+    # 缺陷 4：全等且区分大小写，禁止 startswith/in/大小写折叠。
+    if role == _ADMIN_ROLE:
+        if value is None:
+            return ""
+        return str(value)
+    # 缺陷 10：任何 kind（含未知 kind）都输出固定令牌，无长度/格式信息。
+    return REDACTED
 
 
 def mask_record(record, rules, role):
@@ -102,7 +160,17 @@ def mask_record(record, rules, role):
     返回：
         dict，键集合与 record 相同，敏感字段的值为 REDACTED。
     """
-    raise NotImplementedError
+    masked = {}
+    for name, value in record.items():
+        rule = rules.get(name)
+        if rule is not None and not rule["sensitive"]:
+            # 显式标记为非敏感的字段才允许原样保留。
+            masked[name] = value
+            continue
+        # 缺陷 2：未知字段走 text 安全默认规则，绝不回退原值。
+        kind = rule["kind"] if rule is not None else "text"
+        masked[name] = mask_value(kind, value, role)
+    return masked
 
 
 def aggregate_guard(rows, rules, role):
@@ -130,7 +198,51 @@ def aggregate_guard(rows, rules, role):
     返回：
         dict，组值到 {count: int, 指标输出名: 值} 的映射，只含达到阈值的组。
     """
-    raise NotImplementedError
+    group_fields = [name for name, rule in rules.items() if rule["group_by"]]
+    if len(group_fields) != 1:
+        raise ValueError("group_by 字段必须恰好有一个")
+    group_key = group_fields[0]
+
+    metrics = [
+        (name, rule)
+        for name, rule in rules.items()
+        if rule["aggregate"] == "avg"
+    ]
+    if not metrics:
+        raise ValueError("至少需要一个 aggregate=avg 的指标字段")
+    threshold = max(rule["min_group_size"] for _, rule in metrics)
+
+    # 缺陷 5：阈值按“每个分组各自的行数”判断，而不是总行数。
+    grouped = {}
+    group_order = []
+    for row in rows:
+        if group_key not in row:
+            continue
+        if any(metric_name not in row for metric_name, _ in metrics):
+            continue
+        group_value = row[group_key]
+        if group_value not in grouped:
+            grouped[group_value] = []
+            group_order.append(group_value)
+        grouped[group_value].append(row)
+
+    result = {}
+    for group_value in group_order:
+        members = grouped[group_value]
+        count = len(members)
+        if count < threshold:
+            # 整组（含组名）都不输出。
+            continue
+        entry = {"count": count}
+        for metric_name, rule in metrics:
+            average = sum(row[metric_name] for row in members) / count
+            if role == _ADMIN_ROLE:
+                entry[rule["as"]] = average
+            else:
+                # 缺陷 6：聚合值二次脱敏，平均值本身也可能泄漏个体。
+                entry[rule["as"]] = mask_value(rule["kind"], average, role)
+        result[group_value] = entry
+    return result
 
 
 def export_view(rows, rules, role, format):
@@ -151,7 +263,15 @@ def export_view(rows, rules, role, format):
     返回：
         dict，含 format、rows（脱敏后的记录列表）与 count。
     """
-    raise NotImplementedError
+    if format not in ("json", "csv"):
+        raise ValueError("format 只支持 json 或 csv")
+    # 缺陷 3：导出复用详情页 mask_record 路径，策略里的导出旁路开关被忽略。
+    masked_rows = [mask_record(row, rules, role) for row in rows]
+    return {
+        "format": format,
+        "rows": masked_rows,
+        "count": len(masked_rows),
+    }
 
 
 def audit_access(user, record_id, fields):
@@ -175,7 +295,16 @@ def audit_access(user, record_id, fields):
         必须记录具体字段列表，不能只记录次数；不得修改 user 或 fields；
         不访问存储，也不在此函数内做脱敏。
     """
-    raise NotImplementedError
+    # 缺陷 7：审计落到具体字段列表，而不是只记一个查询计数。
+    field_list = list(fields)
+    return {
+        "user": user["id"],
+        "role": user.get("role", ""),
+        "record_id": record_id,
+        "fields": field_list,
+        "field_count": len(field_list),
+        "action": "view",
+    }
 
 
 def validate_policy(policy):
@@ -196,7 +325,48 @@ def validate_policy(policy):
         再默认规则问题，再聚合阈值问题，最后导出问题；不得修改 policy。
         问题文本包含对应字段名或关键词，便于调用方定位。
     """
-    raise NotImplementedError
+    issues = []
+    if not isinstance(policy, dict):
+        return ["策略结构问题：policy 必须是 dict"]
+
+    schema = policy.get("schema")
+    if schema is None:
+        issues.append("策略结构问题：缺少 schema 列表")
+        schema = []
+
+    fields = policy.get("fields")
+    if not isinstance(fields, dict):
+        issues.append("策略结构问题：fields 必须是 dict")
+        fields = {}
+
+    # 缺陷 8：检查字段覆盖率完整性，逐条报告漏配字段（含详情页字段）。
+    for descriptor in schema:
+        name = descriptor["name"] if isinstance(descriptor, dict) else descriptor
+        if name not in fields:
+            issues.append(f"字段覆盖不完整：字段 {name} 未在 policy.fields 中显式配置")
+
+    # 默认规则必须保持敏感兜底。
+    default = policy.get("default")
+    if default is not None and default.get("sensitive") is not True:
+        issues.append("默认规则问题：default.sensitive 必须为 True")
+
+    # 聚合阈值：整数且不小于 3（bool 不算整数）。
+    aggregate = policy.get("aggregate") or {}
+    min_group_size = aggregate.get("min_group_size") if isinstance(aggregate, dict) else None
+    if (
+        not isinstance(min_group_size, int)
+        or isinstance(min_group_size, bool)
+        or min_group_size < 3
+    ):
+        issues.append("聚合阈值问题：aggregate.min_group_size 必须是不小于 3 的整数")
+
+    # 导出绕过开关一律视为问题。
+    export = policy.get("export") or {}
+    if isinstance(export, dict):
+        if export.get("bypass_masking") or export.get("apply_masking") is False:
+            issues.append("导出绕过问题：导出接口禁止关闭或绕过脱敏")
+
+    return issues
 
 
 def mask_batch(batches, policy, role):
@@ -217,4 +387,17 @@ def mask_batch(batches, policy, role):
     返回：
         dict，批次键到 {role: 实际角色, rows: 脱敏后记录列表} 的映射。
     """
-    raise NotImplementedError
+    result = {}
+    for index, batch in enumerate(batches):
+        # 缺陷 9：每批独立推导规则、独立取角色，不复用任何批次间状态。
+        batch_key = str(batch["id"]) if "id" in batch else str(index)
+        batch_role = batch["role"] if "role" in batch else role
+        batch_rules = field_rules(policy["schema"], policy)
+        result[batch_key] = {
+            "role": batch_role,
+            "rows": [
+                mask_record(row, batch_rules, batch_role)
+                for row in batch["rows"]
+            ],
+        }
+    return result
